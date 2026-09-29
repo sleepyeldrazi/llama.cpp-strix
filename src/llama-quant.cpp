@@ -1436,7 +1436,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+        // an importance matrix is only needed when the tensor is actually
+        // dequantized and requantized (target type != current type); a byte-copy
+        // (target == current) never reads the imatrix, so it must not be required
+        metadata[i].requires_imatrix =
+                tensor->type != metadata[i].target_type &&
+                tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
