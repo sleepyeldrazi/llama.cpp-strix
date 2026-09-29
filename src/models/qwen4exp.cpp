@@ -118,10 +118,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
+    // A sidecar MTP drafter carries only the NextN block plus the shared head/embedding
+    // (the DSpark shape). Detect it up front so the head norm below can be made optional
+    // for such a file: it ships the head norm as nextn.shared_head_norm, not output_hc_norm.
+    const bool mtp_only = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
-    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
+    // sidecar drafters that name the head norm nextn.shared_head_norm make output_hc_norm
+    // optional here (the draft graph falls back to the sidecar's own tensor).
+    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, mtp_only ? TENSOR_NOT_REQUIRED : 0);
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
 
@@ -223,10 +230,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
-    // An MTP-only file carries just the draft block. Keep walking the trunk so the
-    // per-layer bookkeeping still runs, but let its tensors be absent.
-    const bool mtp_only = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    // An MTP-only file carries just the draft block (mtp_only was set at the top of this
+    // function). Keep walking the trunk so the per-layer bookkeeping still runs, but let
+    // its tensors be absent.
+    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
@@ -341,6 +348,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+        // some drafter exports name the head norm here instead of output_hc_norm; optional
+        // so a drafter that ships neither still loads (the draft graph asserts if both are gone)
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -653,7 +663,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
 
-    cur = build_hc_mix(inpL, model.hc_head_norm, model.hc_head_down, model.hc_head_up, nullptr, nullptr, -1);
+    // the final head mixer is shared with the trunk. A sidecar drafter does not ship
+    // output_hc_norm; it names the same flat {hc_dim} gamma nextn.shared_head_norm. build_hc_mix
+    // wants the flat gamma in either case, so this is a plain tensor swap, no reshape.
+    ggml_tensor * head_norm = model.hc_head_norm ? model.hc_head_norm : layer.nextn.shared_head_norm;
+    GGML_ASSERT(head_norm && "MTP head mixer norm missing (need output_hc_norm or nextn.shared_head_norm)");
+    cur = build_hc_mix(inpL, head_norm, model.hc_head_down, model.hc_head_up, nullptr, nullptr, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
