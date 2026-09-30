@@ -370,6 +370,18 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// online drafter arbiter: measure the realized draft economics and stop drafting
+// when a draft round is not worth more than the no-draft floor. see common/spec-arbiter.h
+struct common_params_speculative_arbiter {
+    bool    enabled = false;         // off by default: behavior is unchanged unless --spec-draft-arbiter
+    float   engage    = 1.10f;       // engage when the ewma gain exceeds this
+    float   disengage = 0.95f;       // disengage when the ewma gain falls below this
+    float   alpha     = 0.30f;       // gain ewma alpha (higher = faster reaction, less smoothing)
+    int32_t probe_interval = 16;     // no-draft rounds between probes while disengaged
+    int32_t probe_len      = 2;      // draft length of a probe
+    int32_t warmup         = 4;      // drafted rounds before the state may first flip
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -385,6 +397,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    common_params_speculative_arbiter arbiter;
 
     bool has_dft() const {
         return !draft.mparams.empty();

@@ -4207,6 +4207,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-arbiter"},
+        string_format(
+            "online drafter arbiter: measure the realized draft economics (tokens per round vs the "
+            "no-draft floor) and stop drafting per sequence when a draft round is not paying; "
+            "re-engage via periodic probe drafts when the content turns predictable again. "
+            "off by default: behavior is unchanged without this flag (default: %s)",
+            params.speculative.arbiter.enabled ? "true" : "false"),
+        [](common_params & params) {
+            params.speculative.arbiter.enabled = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ARBITER"));
+    add_opt(common_arg(
+        {"--spec-arbiter-engage"}, "F",
+        string_format("arbiter: engage drafting when the ewma gain exceeds F (default: %.2f)", (double) params.speculative.arbiter.engage),
+        [](common_params & params, const std::string & value) {
+            params.speculative.arbiter.engage = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_ENGAGE"));
+    add_opt(common_arg(
+        {"--spec-arbiter-disengage"}, "F",
+        string_format("arbiter: disengage drafting when the ewma gain falls below F (default: %.2f)", (double) params.speculative.arbiter.disengage),
+        [](common_params & params, const std::string & value) {
+            params.speculative.arbiter.disengage = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_DISENGAGE"));
+    add_opt(common_arg(
+        {"--spec-arbiter-alpha"}, "F",
+        string_format("arbiter: ewma alpha for the measured gain, 0 < F <= 1 (default: %.2f)", (double) params.speculative.arbiter.alpha),
+        [](common_params & params, const std::string & value) {
+            params.speculative.arbiter.alpha = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-arbiter-probe-interval"}, "N",
+        string_format("arbiter: while disengaged, issue a probe draft every N no-draft rounds to detect a content switch (default: %d)", params.speculative.arbiter.probe_interval),
+        [](common_params & params, int value) {
+            params.speculative.arbiter.probe_interval = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_PROBE_INTERVAL"));
+    add_opt(common_arg(
+        {"--spec-arbiter-probe-len"}, "N",
+        string_format("arbiter: length of a probe draft (default: %d)", params.speculative.arbiter.probe_len),
+        [](common_params & params, int value) {
+            params.speculative.arbiter.probe_len = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_PROBE_LEN"));
+    add_opt(common_arg(
+        {"--spec-arbiter-warmup"}, "N",
+        string_format("arbiter: number of drafted rounds before the state may first flip; the first rounds always draft so a predictable prefix is not throttled from step one (default: %d)", params.speculative.arbiter.warmup),
+        [](common_params & params, int value) {
+            params.speculative.arbiter.warmup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ARBITER_WARMUP"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
