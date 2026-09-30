@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-arbiter.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -222,6 +223,159 @@ struct common_speculative_impl {
         return n;
     }
 
+    // Online drafter arbiter (Strata DraftPolicy idea, spec-arbiter.h; see the T5B report).
+    //
+    // A draft round produces (n_accepted + 1) tokens in t_round wall time; the no-draft
+    // floor is 1 token per t_verify wall time, so drafting pays iff
+    //     gain = (n_accepted + 1) * t_verify / t_round > 1
+    // with t_verify = t_round - t_draft (the target verify is not instrumented here, it is
+    // taken by subtraction; it is ~independent of the draft depth because the target verify
+    // is one batched pass dominated by the weight read). The gain is ewma-filtered and the
+    // engage/disengage state uses a hysteresis band, so a single noisy round cannot flip
+    // the state. While disengaged a short probe draft is issued every probe_interval rounds
+    // so a content switch (prose -> repeaty) is detected and drafting re-engages.
+    //
+    // Disabled unless --spec-draft-arbiter. When disabled, arbiter_enabled() is false and
+    // every arbiter call below is a no-op, so the behaviour is exactly the pre-arbiter one.
+    //
+    // Timing is measured in real elapsed time (not a token-count model): draft_time is the
+    // wall time inside the draft call, t_round the wall time from the draft start to the
+    // end of its accept. See the T5B report for the blind spots of this accounting.
+    spec_arbiter::config arb_cfg;
+    bool                 arb_enabled = false; // set by --spec-draft-arbiter
+    std::vector<std::unique_ptr<spec_arbiter::core>> arbiter;
+    std::vector<int32_t>  arb_probe_cap;     // per-seq depth cap for a probe draft (0 = none)
+    std::vector<int64_t>  arb_draft_time_us; // per-seq wall time of the last draft call
+    int64_t t_draft_start_us = 0;            // wall time at the start of the last draft call
+
+    bool arbiter_enabled() const {
+        return arb_enabled && !arbiter.empty();
+    }
+
+    void init_arbiter(const common_params_speculative & params) {
+        const auto & p = params.arbiter;
+        arb_enabled = p.enabled;
+        arb_cfg.engage         = p.engage;
+        arb_cfg.disengage      = p.disengage;
+        arb_cfg.alpha          = p.alpha;
+        arb_cfg.probe_interval = p.probe_interval;
+        arb_cfg.probe_len      = p.probe_len;
+        arb_cfg.warmup         = p.warmup;
+        arb_probe_cap.assign(n_seq, 0);
+        arb_draft_time_us.assign(n_seq, 0);
+
+        if (!arb_enabled || !arb_cfg.valid()) {
+            if (arb_enabled) {
+                SPC_WRN("arbiter config invalid (engage=%.2f disengage=%.2f alpha=%.2f "
+                        "probe_interval=%d probe_len=%d warmup=%d); disabling\n",
+                        arb_cfg.engage, arb_cfg.disengage, arb_cfg.alpha,
+                        arb_cfg.probe_interval, arb_cfg.probe_len, arb_cfg.warmup);
+            }
+            arb_enabled = false;
+            return;
+        }
+
+        arbiter.resize(n_seq);
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            arbiter[seq_id].reset(new spec_arbiter::core(arb_cfg));
+        }
+
+        SPC_INF("arbiter: engage=%.2f disengage=%.2f alpha=%.2f warmup=%d "
+                "probe_interval=%d probe_len=%d\n",
+                arb_cfg.engage, arb_cfg.disengage, arb_cfg.alpha, arb_cfg.warmup,
+                arb_cfg.probe_interval, arb_cfg.probe_len);
+    }
+
+    // new generation for this seq: re-optimistic (engaged, fresh warm-up)
+    void arbiter_reset_seq(llama_seq_id seq_id) {
+        if (!arbiter_enabled() || seq_id < 0 || (size_t) seq_id >= arbiter.size()) {
+            return;
+        }
+        arbiter[seq_id]->reset();
+        arb_probe_cap[seq_id]     = 0;
+        arb_draft_time_us[seq_id] = 0;
+    }
+
+    // called per impl, per round, before the draft: apply the per-seq engage/disengage
+    // decision. a disengaged seq has dp.drafting cleared so the server falls back to a
+    // plain single-token decode (the no-draft floor).
+    void arbiter_apply(common_speculative_draft_params_vec & dparams) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            const spec_arbiter::decision d = arbiter[seq_id]->decide();
+            if (!d.draft) {
+                SPC_DBG("arbiter: seq %d disengaged (gain_ema = %.3f), skipping draft\n",
+                        seq_id, arbiter[seq_id]->gain_ema());
+                dp.drafting = false;
+                continue;
+            }
+
+            arb_probe_cap[seq_id] = d.max_len; // 0 = normal round, >0 = probe depth cap
+        }
+    }
+
+    // called per impl right after the draft call returns: remember the draft wall time
+    // (measured by the dispatcher around impl->draft) and clear the one-shot probe caps
+    void arbiter_on_draft(const common_speculative_draft_params_vec & dparams, int64_t draft_duration_us) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (dparams[seq_id].drafting) {
+                arb_draft_time_us[seq_id] = draft_duration_us;
+            }
+            arb_probe_cap[seq_id] = 0;
+        }
+    }
+
+    // called per accepted round: close the round's timing and update the arbiter state
+    void arbiter_on_accept(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (!arbiter_enabled() || seq_id < 0 || (size_t) seq_id >= arbiter.size()) {
+            return;
+        }
+        const int64_t t_round_us = ggml_time_us() - t_draft_start_us;
+        arbiter[seq_id]->on_drafted_round((int32_t) n_accepted, t_round_us, arb_draft_time_us[seq_id]);
+    }
+
+    // effective draft length for this step, gated by the arbiter. the arbiter only caps the
+    // configured depth (to the probe length on a probe round); the actual depth is still
+    // owned by the acceptance ema (adaptive_n_draft), so the arbiter and the adaptive
+    // sizing compose when both are enabled. the n_min floor is kept for probes too, so a
+    // probe is never shorter than the impl's minimum (which would be cleared and yield no
+    // observation)
+    int32_t arbiter_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
+        if (!arbiter_enabled()) {
+            return adaptive_n_draft(seq_id, n_cfg, n_min);
+        }
+        if (arb_probe_cap[seq_id] > 0 && arb_probe_cap[seq_id] < n_cfg) {
+            n_cfg = arb_probe_cap[seq_id];
+        }
+        return adaptive_n_draft(seq_id, n_cfg, n_min);
+    }
+
+    // one-line arbiter summary for the statistics print (empty when disabled)
+    std::string arbiter_stats_str() const {
+        if (!arbiter_enabled() || arbiter.empty()) {
+            return "";
+        }
+        int32_t n_rnd = 0, n_dr = 0, n_tok = 0, n_e = 0, n_d = 0, n_p = 0;
+        for (const auto & a : arbiter) {
+            n_rnd += a->n_rounds();
+            n_dr  += a->n_drafts();
+            n_tok += a->n_tokens();
+            n_e   += a->n_engage();
+            n_d   += a->n_disengage();
+            n_p   += a->n_probes();
+        }
+        const float gain = arbiter[0]->gain_ema();
+        const char * state = arbiter[0]->engaged() ? "engaged" : "disengaged";
+        return string_format(
+                ", #arbiter %s, gain = %.3f, rounds = %d, drafts = %d, acc = %d, "
+                "engage/disengage = %d/%d, probes = %d",
+                state, (double) gain, n_rnd, n_dr, n_tok, n_e, n_d, n_p);
+    }
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {
         // start optimistic so a predictable prefix is not throttled from step one
         acc_ema.assign(n_seq, acc_ema_init);
@@ -263,6 +417,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
         adaptive_n = this->params.adaptive;
+        init_arbiter(params);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -323,8 +478,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        arbiter_reset_seq(seq_id);
     }
 
     bool process(const llama_batch & batch) override {
@@ -387,7 +542,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+                const int32_t n_draft_eff = arbiter_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 ++i_batch;
@@ -529,6 +684,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
         adaptive_n = this->params.adaptive;
+        init_arbiter(params);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -625,6 +781,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        arbiter_reset_seq(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -850,7 +1007,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+                const int32_t n_draft_eff = arbiter_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 // pre-norm hidden state of this position becomes g_embd for the next step
@@ -1069,6 +1226,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         adaptive_n = this->params.adaptive;
+        init_arbiter(params);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1149,6 +1307,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
 
         reset_acc_ema(seq_id);
+        arbiter_reset_seq(seq_id);
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1312,7 +1471,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // DFlash decodes the whole block in one pass, so a shorter block does
             // not save draft time -- but it does shrink the target's verification
             // batch, which is where the cost actually is.
-            const int32_t n_draft = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+            const int32_t n_draft = arbiter_n_draft(seq_id, params.n_max, params.n_min);
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1491,6 +1650,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         adaptive_n = this->params.adaptive;
+        init_arbiter(params);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -1580,6 +1740,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
 
         reset_acc_ema(seq_id);
+        arbiter_reset_seq(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1786,7 +1947,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // MTP drafts sequentially, so a shorter draft saves draft passes
                 // as well as target verification work.
-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+                const int32_t n_draft_eff = arbiter_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
@@ -2323,7 +2484,7 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
+static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq,
         const std::string & path_static,
@@ -2334,9 +2495,11 @@ static common_speculative_impl_ngram_cache create_state_ngram_cache(
     bool save_static = false;
     bool save_dynamic = false;
 
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
+    // return by pointer: the impl is move-only (arbiter holds a vector of unique_ptr and the
+    // base has a user-declared destructor, so it has no move ctor); returning by value would
+    // need a now-deleted copy
+    return std::make_unique<common_speculative_impl_ngram_cache>(
+            config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -2822,7 +2985,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         config, n_seq,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                impls.push_back(std::move(state));
                 break;
             }
             default:
@@ -2939,7 +3102,21 @@ void common_speculative_draft(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+
+            // the arbiter decides per seq whether this impl drafts at all, and (on a probe
+            // round) how deep; it also starts the round clock the gain is measured against
+            const int64_t t0 = ggml_time_us();
+            if (impl->arbiter_enabled()) {
+                impl->t_draft_start_us = t0;
+                impl->arbiter_apply(dparams);
+            }
+
             impl->draft(dparams);
+
+            if (impl->arbiter_enabled()) {
+                impl->arbiter_on_draft(dparams, ggml_time_us() - t0);
+            }
+
             impl->n_call_draft++;
         }
 
@@ -3025,6 +3202,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl->update_acc_ema(seq_id, n_accepted);
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
+
+        // close the arbiter's round clock and update its engage/disengage state
+        impl->arbiter_on_accept(seq_id, n_accepted);
     }
 
     // accept with the rest of the implementations, using is_other == true
@@ -3094,7 +3274,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        const std::string str_arb = impl->arbiter_stats_str();
+
+        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
@@ -3102,6 +3284,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_stats.c_str(),
-                str_perf.c_str());
+                str_perf.c_str(),
+                str_arb.c_str());
     }
 }
