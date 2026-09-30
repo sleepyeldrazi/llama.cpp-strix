@@ -1066,6 +1066,80 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // T5a: physical KV gather for single-query-token decode (QSA_GATHER=1).
+    // The dense path above runs flash-attention over the FULL K/V under a -INFINITY mask.
+    // The FA kernel skips a tile only when it is fully empty (mask_opt), so a scattered
+    // top_k of 2048 cells out of a long context still touches most K/V tiles. Here we
+    // physically collect the selected rows with ggml_get_rows and attend over the compacted
+    // set, which reads only the top_k rows. The gathered K/V layout is identical to the
+    // original (token t's GQA row is contiguous in the cache, and get_rows keeps that row
+    // contiguous), so build_attn_mha/FA see exactly the same per-head GQA structure.
+    //
+    // Correctness: the top_k set includes the tail of the current position block (the reference
+    // returns indexer_top_k + compress_ratio - 1), and those tail cells are past n_past, so they
+    // must stay masked. We therefore gather the same kq_mask with the same indices and add it to
+    // the compacted attention, which makes the gathered logits exactly the dense-masked logits
+    // over the same visible cells. top_k is a permutation (argsort + view), so there are no
+    // duplicate cells. The gate below keeps multi-token prefill and multi-stream on the dense
+    // path, so only single-query-token decode changes.
+    bool use_gather = false;
+    ggml_tensor * mg = nullptr;
+    if (getenv("QSA_GATHER") != nullptr
+            && top_k->ne[1] == 1        // single query token (decode), n_tps = 1
+            && top_k->ne[3] == 1) {     // single stream
+        const int64_t n_embd_head_k_ = hparams.n_embd_head_k(il);
+        const int64_t n_head_kv_     = hparams.n_head_kv(il);
+        const int64_t gqa            = n_embd_head_k_ * n_head_kv_;
+        const int64_t n_kv_          = k->ne[2];
+
+        // 2D view of the cache so a token's full GQA row is the gather unit.
+        // nb[2] is the stride of the kv axis = row_size(type, gqa), so token t's
+        // gqa elements sit contiguously at offset t*nb[2] (heads are packed first).
+        k = ggml_view_2d(ctx0, k, gqa, n_kv_, k->nb[2], 0);
+        v = ggml_view_2d(ctx0, v, gqa, n_kv_, v->nb[2], 0);
+
+        // gather indices [width, 1, 1, 1]
+        ggml_tensor * idx = ggml_reshape_4d(ctx0, ggml_cont(ctx0, top_k), top_k->ne[0], 1, 1, 1);
+
+        // [gqa, width] f32; reshape to the per-head layout FA expects
+        // (head h of token t at t*gqa + h*n_embd_head, same as the original view)
+        k = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, k, idx),
+                n_embd_head_k_, n_head_kv_, top_k->ne[0]);
+        v = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, v, idx),
+                hparams.n_embd_head_v(il), n_head_kv_, top_k->ne[0]);
+        cb(k, "k_gathered", il);
+        cb(v, "v_gathered", il);
+
+        // gather the same mask over the selected cells: [width, n_tps]
+        // kq_mask is [n_kv, n_tps]; permute so the kv axis is the gather axis (axis 1)
+        mg = ggml_permute(ctx0, kq_mask, 1, 0, 2, 3);
+        mg = ggml_get_rows(ctx0, mg, idx);              // [n_tps, width]
+        mg = ggml_permute(ctx0, mg, 1, 0, 2, 3);        // [width, n_tps]
+        mg = ggml_cont(ctx0, mg);
+        mg = ggml_cast(ctx0, mg, GGML_TYPE_F16);        // FA requires an f16 mask
+        cb(mg, "kq_mask_gathered", il);
+
+        use_gather = true;
+        {
+            static int g_logged = 0;
+            if (g_logged < 12) {
+                fprintf(stderr, "qsa: il=%d physical KV gather active (top_k=%ld, n_kv=%ld)\n",
+                        il, (long) top_k->ne[0], (long) k->ne[2]);
+                fflush(stderr);
+                g_logged++;
+            }
+        }
+    }
+
+    if (use_gather) {
+        ggml_tensor * cur_g = build_attn_mha(q, k, v, nullptr, mg, nullptr, nullptr, kq_scale, il);
+        cb(cur_g, "kqv_out", il);
+        if (inp->self_v_rot) {
+            cur_g = llama_mul_mat_hadamard(ctx0, cur_g, inp->self_v_rot);
+        }
+        return cur_g;
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
