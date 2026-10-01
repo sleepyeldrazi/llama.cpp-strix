@@ -58,6 +58,11 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // FR-Spec reduced-vocab drafters: when set (< vocab.n_tokens()), the output
+    // (head) tensor carries only the lowest-K token columns; the graph pads the
+    // head logits back to the full vocab with -inf. 0 = head covers the vocab.
+    uint32_t n_draft_vocab = 0;
+
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
