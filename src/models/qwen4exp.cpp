@@ -32,6 +32,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    ml.get_key(LLM_KV_DRAFT_VOCAB_SIZE, hparams.n_draft_vocab, false);
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
@@ -125,6 +126,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
+    // FR-Spec reduced-vocab draft: <arch>.draft_vocab_size=K (optional) means the head
+    // tensor ships only the columns for the lowest K token ids while token_embd and the
+    // tokenizer keep the full vocab (the draft embeds target-sampled tokens of any id;
+    // only its proposals are restricted). The MTP graph pads [K,n] head logits back to
+    // [V,n] with -inf, so nothing sized from the vocab count changes.
+    int64_t n_head_vocab = n_vocab;
+    if (hparams.n_draft_vocab) {
+        GGML_ASSERT((int64_t) hparams.n_draft_vocab < n_vocab && "draft vocab must be a strict prefix");
+        n_head_vocab = hparams.n_draft_vocab;
+    }
+
     // there is no output_norm: the final hyper-connection mixer carries it
     // sidecar drafters that name the head norm nextn.shared_head_norm make output_hc_norm
     // optional here (the draft graph falls back to the sidecar's own tensor).
@@ -132,7 +144,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_head_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -673,6 +685,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+
+    // reduced-vocab head (FR-Spec): the matmul covered ids 0..K-1 only. Pad the rows up
+    // to the full vocab with -inf so the sampler and every buffer sized from the vocab
+    // count see a regular [V,n] logits tensor, and the draft can never propose id >= K.
+    // exp(-inf)=0 leaves the softmax denominator untouched, so probabilities over the
+    // kept ids stay exact; the trunk path never has n_draft_vocab set.
+    if (hparams.n_draft_vocab) {
+        const int64_t n_pad = (int64_t) model.vocab.n_tokens() - (int64_t) hparams.n_draft_vocab;
+        ggml_tensor * ones  = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        ggml_tensor * shape = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pad, cur->ne[1], cur->ne[2]);
+        ggml_tensor * neg_inf = ggml_fill(ctx0, ggml_repeat(ctx0, ones, shape), -INFINITY);
+        cur = ggml_concat(ctx0, cur, neg_inf, 0);
+    }
+
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
