@@ -1,3 +1,6 @@
+> **Fork of [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp)** (Adaptive Speculation + Fastest Vulkan on Strix Halo).
+> Model work on top of this fork: [Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS HCQ5_0 (Hugging Face)](https://huggingface.co/sleepyeldrazi/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-HCQ5_0).
+>
 # llama.cpp – Adaptive Speculation + Fastest Vulkan on AMD Strix Halo
 
 **Adaptive speculative decoding that actually works**  
